@@ -1,0 +1,598 @@
+#include <Wire.h> //control data output input
+#include <Adafruit_SSD1306.h> //control display OLED
+#include "BluetoothSerial.h" // bluetooth signal
+#include <ESP32Servo.h>
+#include <Button2.h> // to support triple click
+
+// Multi click Button
+const int BUTTON_PIN = 23;
+Button2 button; 
+
+// 0=A, 1=B, 2=C
+
+const int TURN_PATTERNS[3][5] = {
+  {1, 1, 1, 1, 1}, 
+  {1, 1, 0, 1, 1}, 
+  {1, 1, 0, 0, 1}  
+};
+
+// Global State Variables
+// autoMode: false = Manual (Bluetooth control only), true = Auto (Wait for button)
+bool autoMode = false; 
+// autoRunning: false = Standby (Waiting for button), true = Moving
+bool autoRunning = false; 
+
+int cornerCount = 0; // Tracks the number of corners crossed
+int targetDestination = 0; // destination, 0=Infinite, 1=A, 2=B, 3=C
+
+// {0, 3, 4, 5} -> Index 1: A (3 corners), Index 2: B (4 corners), Index 3: C (5 corners)
+const int DESTINATION_CORNERS[] = {0, 3, 4, 5}; 
+
+// Setting of OLED
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define OLED_RESET -1 // no reset pin
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+
+// Setting bluetooth object
+BluetoothSerial ESP32_BT; 
+
+Servo myServo; 
+const int SERVO_PIN = 19; 
+bool servoState = false; 
+
+Servo myServo2;            // Create second servo object
+const int SERVO2_PIN = 13; // Connect new servo signal wire to GPIO 13
+bool servo2State = false;  // Variable to track if it is at 0 or 180
+
+// Pin of IR Line Tracking Sensor
+const int IR_PINS[] = {36, 39, 34, 35, 4}; //definition the pin at esp 32
+const int NUM_SENSORS = 5; //number of IR sensor
+// Corner detection state
+bool cornerDetected = false;
+
+// Pin of Motor Driver
+const int DIN_LF = 27; 
+const int DIN_LB = 26;
+const int PWM_L = 14;
+
+const int DIN_RF = 25;
+const int DIN_RB = 33;
+const int PWM_R = 32;
+
+// Pin of ultrasonic
+const int TRIG_PIN = 5; // Trigger Pin
+const int ECHO_PIN = 18; // Echo Pin
+const int OBJECT_DIST = 15; // Stop distance in cm
+
+// Logic and variable setting
+const int Black_line = LOW; 
+const int White_line = !Black_line; 
+
+String state = "";
+String lastState = "";
+int s[5];
+char cmd = ' '; // Initialize cmd to space (stop)
+long duration;
+int distanceCm;
+const int weights[5] = {-3, -1, 0, 1, 3}; 
+const int LOST_VALUE = 10; 
+const int TURN_DETECTED = 20;
+
+// PID setting
+float Kp = 13.5; 
+float Ki = 0.0;
+float Kd = 15.0;
+
+float error = 0, P = 0, I = 0, D = 0, PID_value = 0;
+float previous_error = 0;
+
+// speed setting
+int baseSpeed = 120; 
+int maxSpeed = 200;
+
+
+// Fuction declaration
+void moveForward();
+void moveBack();
+void turnLeft();
+void turnRight();
+void spinLeft();
+void spinRight();
+void stopMotor();
+void updateScreen(String text); 
+void MotorSpeed(int leftSpeed, int rightSpeed); 
+void MotorControlPID(int speedL, int speedR); 
+void toggleServo();
+int getDistance();
+void autoLineFollowPID(); 
+int calculateSensorError();
+void checkCornerDetection(); 
+// Button Functions
+void handleSingleClick(Button2& btn); 
+void handleDoubleClick(Button2& btn);
+void handleTripleClick(Button2& btn);
+void handleLongClick(Button2& btn); 
+void startAutoSequence(int dest); 
+void handleBluetooth(); 
+bool checkAllBlack(); 
+
+void setup() {
+
+  Serial.begin(115200);
+  Serial.println("IR Sensor Test Started...");
+  
+  // switch ob bluetooth
+  ESP32_BT.begin("IoT_ESP32");
+  Serial.println("Bluetooth Started! Ready to pair");
+
+  // IR Line Sensor setup
+  for (int i = 0; i < NUM_SENSORS; i++) {
+  pinMode(IR_PINS[i], INPUT);
+  }
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400); 
+  myServo.write(0);
+
+  // Setup Servo 2 (New)
+    myServo2.setPeriodHertz(50);
+    myServo2.attach(SERVO2_PIN, 500, 2400); // Attach to Pin 13
+    myServo2.write(0); // Initialize at 0 degrees
+  
+  // Motor Driver setup
+  pinMode(DIN_LF, OUTPUT); pinMode(DIN_LB, OUTPUT);
+  pinMode(DIN_RF, OUTPUT); pinMode(DIN_RB, OUTPUT);
+  pinMode(PWM_L, OUTPUT); pinMode(PWM_R, OUTPUT);
+  stopMotor();
+  delay(2000);
+  
+  // Ultrasonic setup
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  button.begin(BUTTON_PIN);
+  
+  button.setClickHandler(handleSingleClick);
+  button.setDoubleClickHandler(handleDoubleClick);
+  button.setTripleClickHandler(handleTripleClick); 
+  button.setLongClickHandler(handleLongClick); 
+
+  // OLED setup
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("System Ready");
+  display.display();
+  delay(2000);
+  display.clearDisplay(); 
+  display.display();
+
+}
+
+void loop() {
+
+  button.loop();
+
+  // 1. Bluetooth control
+  handleBluetooth();
+
+  // 2. Get current distance and check for obstacle
+  int currentDist = getDistance();
+  bool objectDetected = (currentDist > 0 && currentDist < OBJECT_DIST);
+  
+  // 3. Mode Logic
+  if (!autoMode) {
+    state = "MANUAL MODE";
+    
+    // Read sensors for manual mode debug/display purposes
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        s[i] = digitalRead(IR_PINS[i]);
+    }
+    
+    switch (cmd) {
+        case 'F':
+          if (objectDetected){ stopMotor(); } else{ moveForward(); }
+          break;
+        case 'B': moveBack(); break;
+        case 'L': spinLeft(); break;
+        case 'R': spinRight(); break;
+        case 'Y':
+             toggleServo(); 
+             cmd = ' '; 
+             break;
+
+        case 'X':          
+              toggleServo2(); 
+              cmd = ' ';      
+              break;
+        default: stopMotor(); break;
+      }
+  }
+  else {
+    // ---------------- AUTO MODE ----------------
+    
+    if (!autoRunning) {
+        // Standby State
+        stopMotor();
+        state = "AUTO: Wait Button";
+    }
+    else {
+            // Check destination
+            if (targetDestination != 0) {
+                int requiredCorners = DESTINATION_CORNERS[targetDestination];
+
+                if (cornerCount < requiredCorners) {
+                    
+              
+                    checkCornerDetection(); 
+                    
+                   
+                    autoLineFollowPID();
+                
+                    state = "Go to " + String((char)('A' + targetDestination - 1)) 
+                        + " (" + String(cornerCount) + "/" + String(requiredCorners) + ")";
+                } 
+                else {
+                    
+                    if (targetDestination >= 1 && targetDestination <= 3) {
+                      spinLeft(); 
+                      delay(500);
+                    }
+
+                   
+                    state = "Final Approach...";
+                    updateScreen(state);
+
+                    moveForward(); 
+                    delay(200); 
+
+                
+                    while (!checkAllBlack()) {
+                        autoLineFollowPID(); 
+                    }
+                    
+                    stopMotor();
+                    state = "Reached " + String((char)('A' + targetDestination - 1)) + "!";
+                    updateScreen(state);
+
+                    autoRunning = false; 
+                    targetDestination = 0;
+                    cornerCount = 0;
+                    delay(2000); 
+                }
+            } 
+            else {
+             
+                checkCornerDetection(); 
+                autoLineFollowPID();
+                state = "Auto Track (Inf)";
+            }
+        
+        }
+    }
+
+  // 4. Screen Update
+  if(state != lastState){
+    updateScreen(state);
+    lastState = state;
+  }
+
+} 
+bool checkAllBlack() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (digitalRead(IR_PINS[i]) != Black_line) {
+      return false;
+    }
+  }
+  return true; 
+}
+
+
+void checkCornerDetection() {
+  // Read line sensors
+  for (int i = 0; i < NUM_SENSORS; i++) {
+      s[i] = digitalRead(IR_PINS[i]);
+  }
+  
+
+ 
+  
+  bool patternLeft = (s[0] == Black_line && s[1] == Black_line && s[2] == Black_line && s[3] == White_line && s[4] == White_line);
+  bool patternRight = (s[0] == White_line && s[1] == White_line && s[2] == Black_line && s[3] == Black_line && s[4] == Black_line);
+
+  if ( (patternLeft || patternRight) && !cornerDetected) {
+      
+      cornerCount++;
+      cornerDetected = true;
+      Serial.printf("Corner Detected! Count: %d\n", cornerCount);
+  } 
+  else if (!patternLeft && !patternRight && cornerDetected) {
+      
+      cornerDetected = false;
+  }
+}
+
+// --- Button Logic Implementation ---
+void startAutoSequence(int dest) {
+    targetDestination = dest;
+    cornerCount = 0;
+    autoRunning = true; 
+    Serial.printf("Button Pressed. Target: %d. Starting...\n", dest);
+}
+
+void handleSingleClick(Button2& btn) {
+    if (autoMode && !autoRunning) startAutoSequence(1); 
+}
+void handleDoubleClick(Button2& btn) {
+    if (autoMode && !autoRunning) startAutoSequence(2); 
+}
+void handleTripleClick(Button2& btn) {
+    if (autoMode && !autoRunning) startAutoSequence(3); 
+}
+void handleLongClick(Button2& btn) {
+    if (autoMode && !autoRunning) startAutoSequence(0); 
+}
+
+void handleBluetooth(){
+  if(ESP32_BT.available()){
+    char receivedCmd = ESP32_BT.read();
+    if(receivedCmd == 'A'){
+      autoMode = true;
+      autoRunning = false; 
+      cmd = ' '; 
+      Serial.println("MODE: AUTO (Waiting for Button)");
+    }
+    else if(receivedCmd == 'M'){
+      autoMode = false;
+      autoRunning = false;
+      cmd = ' '; 
+      stopMotor();
+      Serial.println("MODE: MANUAL");
+    } 
+    else {
+      if (!autoMode) cmd = receivedCmd;
+    }
+  }
+}
+
+int calculateSensorError() {
+ 
+  for(int i=0; i<NUM_SENSORS; i++) s[i] = digitalRead(IR_PINS[i]);
+
+  bool ignoreTurn = false;
+  
+
+  if (targetDestination >= 1 && targetDestination <= 3 && cornerCount > 0 && cornerCount <= 5) {
+     
+      int pattern = TURN_PATTERNS[targetDestination - 1][cornerCount - 1];
+      
+      if (pattern == 0) {
+          ignoreTurn = true; 
+      }
+  }
+
+  
+  if (ignoreTurn) {
+    s[0] = 0; 
+    s[4] = 0; 
+    
+  }
+
+
+  int sensorVal[5];
+  int activeSensors = 0;
+  long weightedSum = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+  
+    if (s[i] == Black_line) {
+      sensorVal[i] = 1; 
+      weightedSum += weights[i];
+      activeSensors++;
+    } else {
+      sensorVal[i] = 0;
+    }
+  }
+
+
+  if (!ignoreTurn) {
+      if (s[0] == Black_line && s[1] == Black_line && s[2] == Black_line) {
+        return -TURN_DETECTED; 
+      }
+      if (s[2] == Black_line && s[3] == Black_line && s[4] == Black_line) {
+        return TURN_DETECTED; 
+      }
+  }
+
+  if (activeSensors == 0) { 
+    if (previous_error < 0) return -LOST_VALUE;
+    else return LOST_VALUE; 
+  }
+
+  return weightedSum / activeSensors;
+}
+void autoLineFollowPID() {
+  error = calculateSensorError();
+
+  // Handle sharp turns (90 degrees)
+  if (error == -TURN_DETECTED) { 
+    spinLeft(); 
+    delay(180);
+    long startTime = millis();
+    while (digitalRead(IR_PINS[2]) != Black_line) {
+      if(millis() - startTime > 2000) break;
+    }
+    error = 0; previous_error = 0; D = 0; I = 0;
+    return;
+  } 
+  else if (error == TURN_DETECTED) {
+    spinRight();
+    delay(180); 
+    long startTime = millis();
+    while (digitalRead(IR_PINS[2]) != Black_line) {
+      if(millis() - startTime > 2000) break;
+    }
+    error = 0; previous_error = 0; D = 0; I = 0;
+    return;
+  }
+
+  if (error == -LOST_VALUE) {
+    spinLeft(); 
+    previous_error = -LOST_VALUE;
+    return;
+  } else if (error == LOST_VALUE) {
+    spinRight();
+    previous_error = LOST_VALUE;
+    return;
+  }
+
+  if (abs(previous_error) == LOST_VALUE && abs(error) < LOST_VALUE) {
+    error = 0; D = 0; previous_error = 0; 
+  }
+
+  P = error;
+  I = I + error;
+  if (error == 0) I = 0;
+  D = error - previous_error;
+  
+  PID_value = (Kp * P) + (Ki * I) + (Kd * D);
+  
+  previous_error = error;
+
+  int leftMotorSpeed = baseSpeed - PID_value + 70;
+  int rightMotorSpeed = baseSpeed + PID_value;
+
+  leftMotorSpeed = constrain(leftMotorSpeed, -maxSpeed, maxSpeed); 
+  rightMotorSpeed = constrain(rightMotorSpeed, -maxSpeed, maxSpeed);
+
+  MotorControlPID(leftMotorSpeed, rightMotorSpeed);
+}
+
+
+void MotorControlPID(int speedL, int speedR) {
+  if (speedL >= 0) {
+    digitalWrite(DIN_LF, HIGH); digitalWrite(DIN_LB, LOW);
+    analogWrite(PWM_L, speedL);
+  } else {
+    digitalWrite(DIN_LF, LOW); digitalWrite(DIN_LB, HIGH);
+    analogWrite(PWM_L, abs(speedL));
+  }
+
+  if (speedR >= 0) {
+    digitalWrite(DIN_RF, HIGH); digitalWrite(DIN_RB, LOW);
+    analogWrite(PWM_R, speedR);
+  } else {
+    digitalWrite(DIN_RF, LOW); digitalWrite(DIN_RB, HIGH);
+    analogWrite(PWM_R, abs(speedR));
+  }
+}
+
+
+void updateScreen(String text) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 25); 
+  display.println(text);
+  display.display();
+}
+
+void MotorSpeed(int leftSpeed, int rightSpeed) {
+  analogWrite(PWM_L, leftSpeed);
+  analogWrite(PWM_R, rightSpeed);
+}
+
+
+void moveForward(){
+  digitalWrite(DIN_LF, HIGH); digitalWrite(DIN_LB, LOW);
+  digitalWrite(DIN_RF, HIGH); digitalWrite(DIN_RB, LOW);
+  MotorSpeed(155, 200);
+}
+
+void moveBack(){
+  digitalWrite(DIN_LF, LOW); digitalWrite(DIN_LB, HIGH);
+  digitalWrite(DIN_RF, LOW); digitalWrite(DIN_RB, HIGH);
+  MotorSpeed(150, 150);
+}
+
+void turnLeft(){
+  digitalWrite(DIN_LF, LOW); digitalWrite(DIN_LB, LOW);
+  digitalWrite(DIN_RF, HIGH); digitalWrite(DIN_RB, LOW);
+  MotorSpeed(150, 0);
+}
+
+void turnRight(){
+  digitalWrite(DIN_LF, HIGH); digitalWrite(DIN_LB, LOW);
+  digitalWrite(DIN_RF, LOW); digitalWrite(DIN_RB, LOW);
+  MotorSpeed(0, 150);
+}
+
+void spinLeft(){
+  digitalWrite(DIN_LF, LOW); digitalWrite(DIN_LB, HIGH);
+  digitalWrite(DIN_RF, HIGH); digitalWrite(DIN_RB, LOW);
+  MotorSpeed(130, 130);
+}
+
+void spinRight(){
+  digitalWrite(DIN_LF, HIGH); digitalWrite(DIN_LB, LOW);
+  digitalWrite(DIN_RF, LOW); digitalWrite(DIN_RB,HIGH);
+  MotorSpeed(130, 130);
+}
+
+void stopMotor(){
+  digitalWrite(DIN_LF, LOW); digitalWrite(DIN_LB, LOW);
+  digitalWrite(DIN_RF, LOW); digitalWrite(DIN_RB, LOW);
+  MotorSpeed(0, 0);
+}
+
+int getDistance(){
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2); 
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH, 5000); 
+  distanceCm = duration * 0.034 / 2;
+
+  if (distanceCm == 0 || distanceCm > 400) {
+    return 999;
+  }
+  
+  return distanceCm;
+}
+
+void toggleServo() {
+  if (servoState == false) {
+    myServo.write(75);
+    servoState = true;
+  } else {
+    myServo.write(0);
+    servoState = false;
+  }
+  delay(300);
+  cmd = ' '; 
+}
+
+void toggleServo2() {
+  if (servo2State == false) {
+    // Currently at 0, move to 180
+    myServo2.write(160);
+    servo2State = true; 
+  } else {
+    // Currently at 180, move to 0
+    myServo2.write(10);
+    servo2State = false; 
+  }
+  delay(300); // Debounce delay
+}
